@@ -1,0 +1,6 @@
+{
+  "name": "Cabañas San Rafael",
+  "description": "Plataforma integral para la gestión y reserva de cabañas en San Rafael, Mendoza. Incluye motor de reservas, guía turística, panel de control y asistente IA por WhatsApp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
