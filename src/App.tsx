@@ -36,10 +36,21 @@ import {
   Flame,
   Volume2,
   Lock,
-  Menu
+  Menu,
+  LogIn,
+  LogOut
 } from "lucide-react";
 import { Cabin, Booking, ChatbotLog, KPIs } from "./types";
 import { boilerplateFiles, BoilerplateFile } from "./boilerplateData";
+import { 
+  auth, 
+  googleProvider, 
+  isFirebaseConfigured, 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged 
+} from "./firebaseClient";
+import type { User } from "./firebaseClient";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"public" | "booking" | "admin" | "chatbot" | "code" | "roadmap">("public");
@@ -65,6 +76,10 @@ export default function App() {
   const [bookingsList, setBookingsList] = useState<Booking[]>([]);
   const [chatLogs, setChatLogs] = useState<ChatbotLog[]>([]);
   const [loadingAdmin, setLoadingAdmin] = useState(false);
+  const [adminUser, setAdminUser] = useState<User | null>(null);
+  const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // WhatsApp Chatbot Simulator States
   const [chatMessages, setChatMessages] = useState<Array<{ role: "user" | "model"; text: string; timestamp: string }>>([
@@ -125,13 +140,43 @@ export default function App() {
     }
   }, [checkIn, checkOut, selectedCabinId]);
 
-  // Load Admin Data on tab switch
-  const loadAdminData = () => {
+  // Load Admin Data with Firebase ID Token
+  const loadAdminData = (tokenToUse?: string) => {
+    const token = tokenToUse || adminToken;
+    if (!token) {
+      setLoadingAdmin(false);
+      return;
+    }
     setLoadingAdmin(true);
+    setAuthError(null);
+
+    const headers = {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json"
+    };
+
     Promise.all([
-      fetch("/api/kpis").then((r) => r.json()),
-      fetch("/api/bookings").then((r) => r.json()),
-      fetch("/api/chatbot-logs").then((r) => r.json())
+      fetch("/api/kpis", { headers }).then(async (r) => {
+        if (!r.ok) {
+          const errData = await r.json().catch(() => ({}));
+          throw new Error(errData.error || (r.status === 403 ? "Tu correo no está en la lista blanca de administradores." : "Error de autenticación."));
+        }
+        return r.json();
+      }),
+      fetch("/api/bookings", { headers }).then(async (r) => {
+        if (!r.ok) {
+          const errData = await r.json().catch(() => ({}));
+          throw new Error(errData.error || (r.status === 403 ? "Tu correo no está en la lista blanca de administradores." : "Error de autenticación."));
+        }
+        return r.json();
+      }),
+      fetch("/api/chatbot-logs", { headers }).then(async (r) => {
+        if (!r.ok) {
+          const errData = await r.json().catch(() => ({}));
+          throw new Error(errData.error || (r.status === 403 ? "Tu correo no está en la lista blanca de administradores." : "Error de autenticación."));
+        }
+        return r.json();
+      })
     ])
       .then(([kpiData, bookingsData, logData]) => {
         setKpis(kpiData);
@@ -139,17 +184,51 @@ export default function App() {
         setChatLogs(logData);
         setLoadingAdmin(false);
       })
-      .catch((err) => {
+      .catch((err: any) => {
         console.error("Error loading admin stats:", err);
+        setAuthError(err.message || "No se pudieron cargar las estadísticas del panel.");
         setLoadingAdmin(false);
       });
   };
 
+  // Listen for Auth changes
   useEffect(() => {
-    if (activeTab === "admin") {
-      loadAdminData();
+    if (!isFirebaseConfigured || !auth) {
+      setAuthChecking(false);
+      return;
     }
+
+    const unsubscribe = onAuthStateChanged(auth, async (user: any) => {
+      setAuthChecking(true);
+      if (user) {
+        try {
+          // Force refresh the token on auth state change
+          const token = await user.getIdToken(true);
+          setAdminUser(user);
+          setAdminToken(token);
+          setAuthError(null);
+          if (activeTab === "admin") {
+            loadAdminData(token);
+          }
+        } catch (err: any) {
+          console.error("Error al obtener token de Firebase:", err);
+          setAuthError("No se pudo obtener el token de autenticación.");
+        }
+      } else {
+        setAdminUser(null);
+        setAdminToken(null);
+      }
+      setAuthChecking(false);
+    });
+
+    return () => unsubscribe();
   }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab === "admin" && adminToken) {
+      loadAdminData(adminToken);
+    }
+  }, [activeTab, adminToken]);
 
   // Handle Booking Submit
   const handleBookingSubmit = (e: React.FormEvent) => {
@@ -179,7 +258,14 @@ export default function App() {
         if (!data.error) {
           setBookingSuccessData(data);
           setBookingStep(3);
-          triggerBanner("¡Reserva confirmada con éxito! Se sumaron puntos de fidelización.");
+          if (data.paymentUrl) {
+            triggerBanner("¡Reserva iniciada! Redirigiendo a Mercado Pago para realizar el pago seguro...");
+            setTimeout(() => {
+              window.location.href = data.paymentUrl;
+            }, 1800);
+          } else {
+            triggerBanner("¡Reserva registrada con éxito! Por favor completá el pago para confirmarla.");
+          }
         } else {
           triggerBanner("Error al procesar reserva: " + data.error);
         }
@@ -810,26 +896,46 @@ export default function App() {
             {/* STEP 3: BOOKING SUCCESS & SHOW LOYALTY POINTS */}
             {bookingStep === 3 && bookingSuccessData && (
               <div className="bg-white p-8 sm:p-12 rounded-3xl border border-[#F5F0E1] shadow-2xl text-center max-w-xl mx-auto space-y-6">
-                <div className="w-20 h-20 bg-emerald-50 text-[#5C946E] rounded-full flex items-center justify-center mx-auto shadow-md">
+                <div className="w-20 h-20 bg-amber-50 text-amber-600 rounded-full flex items-center justify-center mx-auto shadow-md animate-pulse">
                   <CheckCircle className="w-12 h-12" />
                 </div>
                 
                 <div className="space-y-2">
-                  <h4 className="text-2xl font-serif font-black text-[#0F4C81]">¡Reserva Registrada y Confirmada!</h4>
-                  <p className="text-slate-500 text-xs">
-                    ¡Listo, {bookingSuccessData.guestName}! Tu estadía ha sido reservada de forma directa. Tu identificador único de reserva es:
+                  <h4 className="text-2xl font-serif font-black text-[#0F4C81]">¡Reserva Registrada!</h4>
+                  <p className="text-slate-600 text-xs font-semibold">
+                    Estado: <span className="text-amber-600 uppercase font-bold px-2 py-0.5 bg-amber-50 border border-amber-200 rounded">Pendiente de Pago</span>
                   </p>
-                  <span className="inline-block bg-[#0F4C81]/5 text-[#0F4C81] font-mono text-sm font-black px-4 py-1.5 rounded-lg border border-[#0F4C81]/15 tracking-widest">{bookingSuccessData.id}</span>
+                  <p className="text-slate-500 text-xs pt-2">
+                    ¡Hola, {bookingSuccessData.guestName}! Tu reserva ha sido registrada con éxito. Para confirmarla definitivamente y congelar el precio, debés completar el pago seguro con Mercado Pago.
+                  </p>
+                  <div className="pt-2">
+                    <span className="text-slate-400 text-[10px] block mb-1">CÓDIGO DE RESERVA:</span>
+                    <span className="inline-block bg-[#0F4C81]/5 text-[#0F4C81] font-mono text-sm font-black px-4 py-1.5 rounded-lg border border-[#0F4C81]/15 tracking-widest">{bookingSuccessData.id}</span>
+                  </div>
                 </div>
+
+                {bookingSuccessData.paymentUrl && (
+                  <div className="p-4 bg-blue-50 border border-blue-100 rounded-2xl space-y-3">
+                    <p className="text-slate-600 text-[11px] font-medium">
+                      Si la redirección automática no comenzó, hacé clic en el botón de abajo para pagar:
+                    </p>
+                    <a
+                      href={bookingSuccessData.paymentUrl}
+                      className="w-full bg-[#009EE3] hover:bg-[#0086C3] text-white py-3 px-6 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-2 shadow-md cursor-pointer text-center"
+                    >
+                      💳 Proceder al Pago con Mercado Pago
+                    </a>
+                  </div>
+                )}
 
                 <div className="bg-[#F5F0E1]/50 p-5 rounded-2xl border border-[#F5F0E1] text-left text-xs space-y-3">
                   <h5 className="font-bold text-[#0F4C81] flex items-center gap-1">
                     <Award className="w-4 h-4" /> Resumen de Beneficios por Reserva Directa:
                   </h5>
                   <ul className="space-y-2 text-slate-600">
-                    <li>🎯 <strong>Fidelización:</strong> Acumulaste <strong>{bookingSuccessData.pointsEarned} puntos</strong> (1 punto por cada $1000 ARS) canjeables en tu próximo viaje.</li>
+                    <li>🎯 <strong>Fidelización:</strong> Acumularás <strong>{bookingSuccessData.pointsEarned} puntos</strong> (1 punto por cada $1000 ARS) canjeables en tu próximo viaje una vez confirmado el pago.</li>
                     <li>🎁 <strong>Nivel:</strong> Ascendiste automáticamente al nivel <strong>Viajero Explorador</strong> con prioridad de Late Check-Out.</li>
-                    <li>📨 <strong>Notificación:</strong> Se envió un voucher PDF a <strong>{bookingSuccessData.guestEmail}</strong> y se habilitó tu asistente WhatsApp Santi.</li>
+                    <li>📨 <strong>Confirmación:</strong> Ni bien se apruebe el pago, recibirás el voucher PDF en <strong>{bookingSuccessData.guestEmail}</strong> y se habilitará tu asistente WhatsApp Santi.</li>
                   </ul>
                 </div>
 
@@ -981,110 +1087,253 @@ export default function App() {
         {/* ==================== TAB: ADMIN PANEL ==================== */}
         {activeTab === "admin" && (
           <div className="space-y-8">
-            <div className="flex flex-wrap justify-between items-center gap-4">
-              <div className="space-y-1">
-                <h3 className="text-3xl font-serif font-black text-[#0F4C81]">Panel de Control Administrativo</h3>
-                <p className="text-slate-500 text-sm">Monitoreo de ocupación de las cabañas, ingresos acumulados, base de huéspedes y conversaciones de la IA.</p>
-              </div>
-              <button 
-                onClick={loadAdminData}
-                disabled={loadingAdmin}
-                className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all flex items-center gap-1 cursor-pointer"
-              >
-                🔄 Actualizar Datos
-              </button>
+            <div className="space-y-1">
+              <h3 className="text-3xl font-serif font-black text-[#0F4C81]">Panel de Control Administrativo</h3>
+              <p className="text-slate-500 text-sm">Monitoreo de ocupación de las cabañas, ingresos acumulados, base de huéspedes y conversaciones de la IA.</p>
             </div>
 
-            {loadingAdmin ? (
-              <div className="text-center py-16">
-                <div className="w-12 h-12 border-4 border-slate-200 border-t-[#0F4C81] rounded-full animate-spin mx-auto mb-4"></div>
-                <p className="text-slate-500 font-semibold text-sm">Cargando base de datos en tiempo real...</p>
+            {/* CASE 1: INITIAL STATE (CHECKING AUTH SESSION) */}
+            {authChecking ? (
+              <div className="bg-white p-12 rounded-3xl border border-[#F5F0E1] shadow-xl text-center max-w-md mx-auto space-y-4">
+                <div className="w-12 h-12 border-4 border-slate-200 border-t-[#0F4C81] rounded-full animate-spin mx-auto"></div>
+                <p className="text-slate-500 font-semibold text-sm">Verificando estado de la sesión...</p>
+              </div>
+            ) : /* CASE 2: FIREBASE CLIENT CONFIGURATION MISSING */
+            !isFirebaseConfigured || !auth ? (
+              <div className="bg-white p-8 rounded-3xl border border-amber-200 shadow-xl max-w-2xl mx-auto space-y-6">
+                <div className="w-16 h-16 bg-amber-50 text-amber-600 rounded-full flex items-center justify-center mx-auto shadow-sm">
+                  <ShieldCheck className="w-10 h-10" />
+                </div>
+                <div className="text-center space-y-2">
+                  <h3 className="text-xl font-serif font-black text-[#0F4C81]">Configuración de Autenticación Requerida</h3>
+                  <p className="text-slate-600 text-xs">
+                    Para habilitar el inicio de sesión seguro con Google en el panel de administración, debés configurar las variables de entorno de Firebase correspondientes a tu proyecto en las opciones de configuración de la app.
+                  </p>
+                </div>
+                <div className="bg-slate-50 p-5 rounded-2xl border border-slate-100 text-xs text-slate-600 space-y-3">
+                  <p className="font-bold text-[#0F4C81]">Variables de entorno requeridas en .env (Sección de Cliente):</p>
+                  <ul className="list-disc pl-5 space-y-1.5 font-mono text-[11px] text-slate-500">
+                    <li>VITE_FIREBASE_API_KEY</li>
+                    <li>VITE_FIREBASE_AUTH_DOMAIN</li>
+                    <li>VITE_FIREBASE_PROJECT_ID</li>
+                    <li>VITE_FIREBASE_APP_ID</li>
+                  </ul>
+                  <p className="text-[11px] text-slate-400 pt-2 border-t border-slate-200">
+                    Una vez configuradas las credenciales de tu proyecto de Firebase, el panel mostrará el botón de acceso con Google.
+                  </p>
+                </div>
+              </div>
+            ) : /* CASE 3: FIREBASE CONFIGURED BUT USER NOT SIGNED IN */
+            !adminUser ? (
+              <div className="bg-white p-8 sm:p-12 rounded-3xl border border-[#F5F0E1] shadow-2xl max-w-md mx-auto text-center space-y-6">
+                <div className="w-16 h-16 bg-[#0F4C81]/5 text-[#0F4C81] rounded-full flex items-center justify-center mx-auto shadow-inner">
+                  <ShieldCheck className="w-10 h-10" />
+                </div>
+                <div className="space-y-2">
+                  <h3 className="text-2xl font-serif font-black text-[#0F4C81]">Acceso Administrativo</h3>
+                  <p className="text-slate-500 text-xs">
+                    Iniciá sesión de forma segura con tu cuenta de Google para acceder a las estadísticas, reservas e historial.
+                  </p>
+                </div>
+
+                {authError && (
+                  <div className="p-4 bg-rose-50 border border-rose-100 rounded-xl text-rose-700 text-xs text-left font-medium">
+                    ⚠️ Error: {authError}
+                  </div>
+                )}
+
+                <button
+                  onClick={async () => {
+                    try {
+                      setAuthError(null);
+                      await signInWithPopup(auth, googleProvider);
+                    } catch (err: any) {
+                      console.error("Error al iniciar sesión:", err);
+                      setAuthError(err.message || "Error al autenticar con Google.");
+                    }
+                  }}
+                  className="w-full bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 py-3.5 px-6 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-2.5 shadow-md cursor-pointer hover:shadow-lg"
+                >
+                  <svg className="w-4 h-4" viewBox="0 0 24 24">
+                    <path
+                      fill="#4285F4"
+                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                    />
+                  </svg>
+                  Iniciar Sesión con Google
+                </button>
+
+                <div className="text-[10px] text-slate-400 border-t border-slate-100 pt-4">
+                  Solo cuentas autorizadas en la lista blanca de admins.
+                </div>
               </div>
             ) : (
-              <div className="space-y-8">
-                {/* KPIs Dashboard Grid */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                  {[
-                    { label: "Porcentaje de Ocupación", value: `${kpis.occupancyRate}%`, icon: Users, color: "text-[#4EA8DE] bg-[#4EA8DE]/10" },
-                    { label: "Facturación Total (ARS)", value: `$${kpis.totalRevenue.toLocaleString("es-AR")}`, icon: DollarSign, color: "text-[#5C946E] bg-[#5C946E]/10" },
-                    { label: "Huéspedes Activos", value: `${kpis.activeGuests} personas`, icon: TrendingUp, color: "text-amber-600 bg-amber-50" },
-                    { label: "Reservas Pendientes", value: `${kpis.pendingBookings} registros`, icon: Clock, color: "text-[#0F4C81] bg-[#0F4C81]/5" }
-                  ].map((stat, idx) => {
-                    const StatIcon = stat.icon;
-                    return (
-                      <div key={idx} className="bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg flex items-center justify-between">
-                        <div className="space-y-1">
-                          <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">{stat.label}</span>
-                          <span className="text-2xl font-black text-slate-800">{stat.value}</span>
-                        </div>
-                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${stat.color}`}>
-                          <StatIcon className="w-6 h-6" />
+              /* CASE 4: AUTHENTICATED ADMIN USER */
+              <div className="space-y-6">
+                {/* Active Session Status Bar */}
+                <div className="flex flex-wrap justify-between items-center gap-4 bg-white p-4 sm:px-6 rounded-2xl border border-[#F5F0E1] shadow-md">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-[#0F4C81]/5 text-[#0F4C81] rounded-full flex items-center justify-center font-bold text-sm">
+                      {adminUser.email ? adminUser.email[0].toUpperCase() : "A"}
+                    </div>
+                    <div>
+                      <p className="text-xs font-bold text-slate-800">{adminUser.displayName || "Administrador Autorizado"}</p>
+                      <p className="text-[10px] text-slate-500">{adminUser.email}</p>
+                    </div>
+                  </div>
+                  
+                  <div className="flex items-center gap-3">
+                    <button 
+                      onClick={() => loadAdminData()}
+                      disabled={loadingAdmin}
+                      className="bg-slate-50 hover:bg-slate-100 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer border border-slate-200"
+                    >
+                      🔄 Actualizar Datos
+                    </button>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          await signOut(auth);
+                        } catch (err) {
+                          console.error("Error al cerrar sesión:", err);
+                        }
+                      }}
+                      className="bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-xs px-4 py-2 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer border border-rose-100"
+                    >
+                      <LogOut className="w-3.5 h-3.5" /> Cerrar Sesión
+                    </button>
+                  </div>
+                </div>
+
+                {/* Loading or Whitelist Error States */}
+                {authError ? (
+                  <div className="p-8 bg-rose-50 border border-rose-100 rounded-3xl text-rose-700 text-sm flex flex-col items-center justify-center space-y-4 max-w-xl mx-auto text-center shadow-lg">
+                    <div className="w-12 h-12 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center">
+                      <ShieldCheck className="w-6 h-6" />
+                    </div>
+                    <div className="space-y-1">
+                      <p className="font-bold">⚠️ Acceso Denegado / Error</p>
+                      <p className="text-xs text-slate-600">{authError}</p>
+                    </div>
+                    {authError.includes("lista blanca") && (
+                      <button 
+                        onClick={async () => {
+                          try {
+                            await signOut(auth);
+                          } catch (err) {
+                            console.error(err);
+                          }
+                        }}
+                        className="bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 font-bold text-xs px-4 py-2 rounded-xl transition-all cursor-pointer shadow-sm"
+                      >
+                        🚪 Acceder con otra cuenta de Google
+                      </button>
+                    )}
+                  </div>
+                ) : loadingAdmin ? (
+                  <div className="text-center py-16">
+                    <div className="w-12 h-12 border-4 border-slate-200 border-t-[#0F4C81] rounded-full animate-spin mx-auto mb-4"></div>
+                    <p className="text-slate-500 font-semibold text-sm">Cargando base de datos del servidor...</p>
+                  </div>
+                ) : (
+                  <div className="space-y-8 animate-fade-in">
+                    {/* KPIs Dashboard Grid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                      {[
+                        { label: "Porcentaje de Ocupación", value: `${kpis.occupancyRate}%`, icon: Users, color: "text-[#4EA8DE] bg-[#4EA8DE]/10" },
+                        { label: "Facturación Total (ARS)", value: `$${kpis.totalRevenue.toLocaleString("es-AR")}`, icon: DollarSign, color: "text-[#5C946E] bg-[#5C946E]/10" },
+                        { label: "Huéspedes Activos", value: `${kpis.activeGuests} personas`, icon: TrendingUp, color: "text-amber-600 bg-amber-50" },
+                        { label: "Reservas Pendientes", value: `${kpis.pendingBookings} registros`, icon: Clock, color: "text-[#0F4C81] bg-[#0F4C81]/5" }
+                      ].map((stat, idx) => {
+                        const StatIcon = stat.icon;
+                        return (
+                          <div key={idx} className="bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg flex items-center justify-between">
+                            <div className="space-y-1">
+                              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">{stat.label}</span>
+                              <span className="text-2xl font-black text-slate-800">{stat.value}</span>
+                            </div>
+                            <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${stat.color}`}>
+                              <StatIcon className="w-6 h-6" />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Main section: Bookings Table & Live Chat logs */}
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                      {/* Bookings table */}
+                      <div className="lg:col-span-7 bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg space-y-4">
+                        <h4 className="font-serif font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-1.5">
+                          <span>🏨</span> Registro de Reservas Recientes
+                        </h4>
+
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left border-collapse text-xs">
+                            <thead>
+                              <tr className="border-b border-slate-100 text-slate-400 font-bold">
+                                <th className="pb-2">ID</th>
+                                <th className="pb-2">Huésped</th>
+                                <th className="pb-2">Cabaña</th>
+                                <th className="pb-2">Noches</th>
+                                <th className="pb-2 text-right">Total</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-50 font-medium text-slate-600">
+                              {bookingsList.map((booking) => (
+                                <tr key={booking.id} className="hover:bg-[#FDFBF7]/50">
+                                  <td className="py-2.5 font-mono text-[#0F4C81] font-bold">{booking.id}</td>
+                                  <td className="py-2.5">
+                                    <span className="block font-bold text-slate-800">{booking.guestName}</span>
+                                    <span className="block text-[10px] text-slate-400">{booking.guestPhone}</span>
+                                  </td>
+                                  <td className="py-2.5">{booking.cabinName}</td>
+                                  <td className="py-2.5">{booking.nights} noches</td>
+                                  <td className="py-2.5 text-right font-bold text-slate-800">${booking.totalAmount.toLocaleString("es-AR")}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
 
-                {/* Main section: Bookings Table & Live Chat logs */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                  {/* Bookings table */}
-                  <div className="lg:col-span-7 bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg space-y-4">
-                    <h4 className="font-serif font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-1.5">
-                      <span>🏨</span> Registro de Reservas Recientes
-                    </h4>
+                      {/* Live Chat logs */}
+                      <div className="lg:col-span-5 bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg space-y-4">
+                        <h4 className="font-serif font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-1.5">
+                          <span className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-ping"></span>
+                          Historial del Chatbot WhatsApp
+                        </h4>
 
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead>
-                          <tr className="border-b border-slate-100 text-slate-400 font-bold">
-                            <th className="pb-2">ID</th>
-                            <th className="pb-2">Huésped</th>
-                            <th className="pb-2">Cabaña</th>
-                            <th className="pb-2">Noches</th>
-                            <th className="pb-2 text-right">Total</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-50 font-medium text-slate-600">
-                          {bookingsList.map((booking) => (
-                            <tr key={booking.id} className="hover:bg-[#FDFBF7]/50">
-                              <td className="py-2.5 font-mono text-[#0F4C81] font-bold">{booking.id}</td>
-                              <td className="py-2.5">
-                                <span className="block font-bold text-slate-800">{booking.guestName}</span>
-                                <span className="block text-[10px] text-slate-400">{booking.guestPhone}</span>
-                              </td>
-                              <td className="py-2.5">{booking.cabinName}</td>
-                              <td className="py-2.5">{booking.nights} noches</td>
-                              <td className="py-2.5 text-right font-bold text-slate-800">${booking.totalAmount.toLocaleString("es-AR")}</td>
-                            </tr>
+                        <div className="space-y-4 max-h-[320px] overflow-y-auto pr-1">
+                          {chatLogs.map((log) => (
+                            <div key={log.id} className="bg-slate-50 p-3 rounded-xl border border-slate-100 space-y-2 text-xs">
+                              <div className="flex justify-between items-center text-[10px] border-b border-slate-200/50 pb-1.5">
+                                <span className="font-bold text-[#0F4C81]">{log.userName} ({log.userPhone})</span>
+                                <span className="text-slate-400 font-mono">{new Date(log.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}</span>
+                              </div>
+                              <div className="space-y-1 leading-relaxed">
+                                <p className="text-slate-500"><strong className="text-slate-600">Mensaje:</strong> "{log.message}"</p>
+                                <p className="text-[#5C946E] bg-[#5C946E]/5 p-2 rounded-lg mt-1 border border-[#5C946E]/10"><strong className="text-[#467354]">Santi IA:</strong> {log.response}</p>
+                              </div>
+                            </div>
                           ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  {/* Live Chat logs */}
-                  <div className="lg:col-span-5 bg-white p-6 rounded-2xl border border-[#F5F0E1] shadow-lg space-y-4">
-                    <h4 className="font-serif font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-1.5">
-                      <span className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-ping"></span>
-                      Historial del Chatbot WhatsApp
-                    </h4>
-
-                    <div className="space-y-4 max-h-[320px] overflow-y-auto pr-1">
-                      {chatLogs.map((log) => (
-                        <div key={log.id} className="bg-slate-50 p-3 rounded-xl border border-slate-100 space-y-2 text-xs">
-                          <div className="flex justify-between items-center text-[10px] border-b border-slate-200/50 pb-1.5">
-                            <span className="font-bold text-[#0F4C81]">{log.userName} ({log.userPhone})</span>
-                            <span className="text-slate-400 font-mono">{new Date(log.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}</span>
-                          </div>
-                          <div className="space-y-1 leading-relaxed">
-                            <p className="text-slate-500"><strong className="text-slate-600">Mensaje:</strong> "{log.message}"</p>
-                            <p className="text-[#5C946E] bg-[#5C946E]/5 p-2 rounded-lg mt-1 border border-[#5C946E]/10"><strong className="text-[#467354]">Santi IA:</strong> {log.response}</p>
-                          </div>
                         </div>
-                      ))}
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
             )}
           </div>

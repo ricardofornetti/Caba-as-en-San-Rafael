@@ -1,0 +1,135 @@
+{
+  "entities": {
+    "Booking": {
+      "title": "Booking",
+      "description": "Cabin reservation data",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique reservation identifier (Firestore document ID)"
+        },
+        "cabinId": {
+          "type": "string",
+          "description": "Identifier of the reserved cabin"
+        },
+        "cabinName": {
+          "type": "string",
+          "description": "Name of the reserved cabin"
+        },
+        "guestName": {
+          "type": "string",
+          "description": "Name of the primary guest"
+        },
+        "guestEmail": {
+          "type": "string",
+          "description": "Email address of the primary guest"
+        },
+        "guestPhone": {
+          "type": "string",
+          "description": "Phone number of the primary guest"
+        },
+        "checkIn": {
+          "type": "string",
+          "description": "Check-in date (YYYY-MM-DD)"
+        },
+        "checkOut": {
+          "type": "string",
+          "description": "Check-out date (YYYY-MM-DD)"
+        },
+        "nights": {
+          "type": "integer",
+          "description": "Number of reserved nights"
+        },
+        "guestsCount": {
+          "type": "integer",
+          "description": "Number of guests"
+        },
+        "totalAmount": {
+          "type": "integer",
+          "description": "Total reservation price in ARS"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "confirmed", "cancelled"],
+          "description": "Reservation status"
+        },
+        "pointsEarned": {
+          "type": "integer",
+          "description": "Loyalty points earned from the booking"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of when the booking was created"
+        }
+      },
+      "required": [
+        "id",
+        "cabinId",
+        "cabinName",
+        "guestName",
+        "guestEmail",
+        "guestPhone",
+        "checkIn",
+        "checkOut",
+        "nights",
+        "guestsCount",
+        "totalAmount",
+        "status",
+        "pointsEarned",
+        "createdAt"
+      ]
+    },
+    "ChatbotLog": {
+      "title": "ChatbotLog",
+      "description": "Interaction log with the AI digital assistant",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Log unique identifier"
+        },
+        "userPhone": {
+          "type": "string",
+          "description": "Phone number of the user"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Name of the user"
+        },
+        "message": {
+          "type": "string",
+          "description": "User message text"
+        },
+        "response": {
+          "type": "string",
+          "description": "Bot reply text"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO timestamp of the interaction"
+        }
+      },
+      "required": [
+        "id",
+        "userPhone",
+        "userName",
+        "message",
+        "response",
+        "timestamp"
+      ]
+    }
+  },
+  "firestore": {
+    "bookings": {
+      "schema": "Booking",
+      "description": "Collection storing guest bookings for the cabins"
+    },
+    "chatbot_logs": {
+      "schema": "ChatbotLog",
+      "description": "Collection storing historical conversation logs between the digital assistant and users"
+    }
+  }
+}

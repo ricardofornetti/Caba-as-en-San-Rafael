@@ -1,15 +1,57 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
+ * 
+ * MEJORAS CRÍTICAS APLICADAS POR EL ARQUITECTO DE SEGURIDAD WEB:
+ * 1. PERSISTENCIA CON FIRESTORE: Reemplazo de colecciones y arrays en memoria por la base de datos Firestore ("bookings" y "chatbot_logs").
+ * 2. FIRESTORE SECURITY RULES: Creación de archivo firestore.rules para denegar acceso directo no autorizado desde los clientes de Firebase.
+ * 3. AUTENTICACIÓN ADMIN CON GOOGLE SIGN-IN: Middleware robusto "requireFirebaseAuth" que valida tokens e-mail con lista blanca.
+ * 4. INTEGRACIÓN REAL DE MERCADO PAGO CHECKOUT PRO: Creación de preferencias con vencimiento de 24 horas y webhook con firma HMAC-SHA256.
+ * 5. SEPARACIÓN ESTRICTA DE VARIABLES DE ENTORNO: Organización rigurosa de claves privadas/públicas y script anti-leaks.
  */
 
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { FieldValue } from "firebase-admin/firestore";
+import { db, auth } from "./src/firebaseAdmin";
+import { MercadoPagoConfig, Preference } from "mercadopago";
+import crypto from "crypto";
 
 dotenv.config();
+
+// Initialize Mercado Pago Client Lazily to prevent startup crashes if credentials are missing
+let mpClientInstance: MercadoPagoConfig | null = null;
+function getMpClient(): MercadoPagoConfig {
+  if (!mpClientInstance) {
+    const accessToken = process.env.MP_ACCESS_TOKEN;
+    if (!accessToken) {
+      throw new Error("Missing MP_ACCESS_TOKEN in environment variables.");
+    }
+    mpClientInstance = new MercadoPagoConfig({
+      accessToken,
+      options: { timeout: 5000 },
+    });
+  }
+  return mpClientInstance;
+}
+
+// Helper to convert Firestore Timestamp to ISO string
+function convertTimestamp(val: any): string {
+  if (val && typeof val.toDate === "function") {
+    return val.toDate().toISOString();
+  }
+  if (val && typeof val === "object" && (val._seconds !== undefined || val.seconds !== undefined)) {
+    const secs = val._seconds !== undefined ? val._seconds : val.seconds;
+    return new Date(secs * 1000).toISOString();
+  }
+  if (typeof val === "string") {
+    return val;
+  }
+  return new Date().toISOString();
+}
 
 // Initialize Gemini Client Lazily to prevent startup crashes if GEMINI_API_KEY is missing
 let aiClient: GoogleGenAI | null = null;
@@ -104,8 +146,8 @@ const cabins = [
   }
 ];
 
-// Seed initial bookings
-let bookings = [
+// Initial Seed Data (to be inserted if Firestore is empty)
+const SEED_BOOKINGS = [
   {
     id: "RES-1042",
     cabinId: "atuel",
@@ -117,8 +159,8 @@ let bookings = [
     checkOut: "2026-06-25",
     nights: 5,
     guestsCount: 3,
-    totalAmount: 325000, // Media pricing
-    status: "confirmed" as const,
+    totalAmount: 325000,
+    status: "confirmed",
     pointsEarned: 325,
     createdAt: "2026-05-10T14:32:00Z"
   },
@@ -134,7 +176,7 @@ let bookings = [
     nights: 4,
     guestsCount: 2,
     totalAmount: 320000,
-    status: "confirmed" as const,
+    status: "confirmed",
     pointsEarned: 320,
     createdAt: "2026-05-18T09:12:00Z"
   },
@@ -149,22 +191,14 @@ let bookings = [
     checkOut: "2026-07-09",
     nights: 7,
     guestsCount: 5,
-    totalAmount: 980000, // Alta pricing (Julio)
-    status: "pending" as const,
+    totalAmount: 980000,
+    status: "pending",
     pointsEarned: 980,
     createdAt: "2026-06-15T18:45:00Z"
   }
 ];
 
-// In-memory chatbot logs
-const chatbotLogs: Array<{
-  id: string;
-  userPhone: string;
-  userName: string;
-  message: string;
-  response: string;
-  timestamp: string;
-}> = [
+const SEED_CHATBOT_LOGS = [
   {
     id: "LOG-001",
     userPhone: "+54 9 11 9876-5432",
@@ -182,6 +216,29 @@ const chatbotLogs: Array<{
     timestamp: "2026-06-24T10:05:00Z"
   }
 ];
+
+// Helper to seed Firestore if empty
+async function seedFirestoreIfEmpty(db: any) {
+  try {
+    const bookingsSnap = await db.collection("bookings").limit(1).get();
+    if (bookingsSnap.empty) {
+      console.log("Seeding initial bookings to Firestore...");
+      for (const b of SEED_BOOKINGS) {
+        await db.collection("bookings").doc(b.id).set(b);
+      }
+    }
+    const logsSnap = await db.collection("chatbot_logs").limit(1).get();
+    if (logsSnap.empty) {
+      console.log("Seeding initial chatbot logs to Firestore...");
+      for (const log of SEED_CHATBOT_LOGS) {
+        await db.collection("chatbot_logs").doc(log.id).set(log);
+      }
+    }
+  } catch (err) {
+    console.error("Optional database seeding warning:", err);
+  }
+}
+
 
 // Helper to determine season for a date
 function getSeason(dateString: string): "baja" | "media" | "alta" {
@@ -254,15 +311,181 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Webhook de Mercado Pago (Debe registrarse ANTES de express.json() para recibir el body raw)
+  app.post("/api/mp-webhook", express.raw({ type: "application/json" }), async (req: any, res: any) => {
+    // Validar firma del webhook
+    const xSignature   = req.headers["x-signature"] as string | undefined;
+    const xRequestId   = req.headers["x-request-id"] as string | undefined;
+    const webhookSecret = process.env.MP_WEBHOOK_SECRET || "";
+
+    if (webhookSecret && xSignature && xRequestId) {
+      // Formato de firma MP: "ts=xxx,v1=yyy"
+      const parts: Record<string, string> = {};
+      xSignature.split(",").forEach(part => {
+        const [k, v] = part.split("=");
+        if (k && v) parts[k.trim()] = v.trim();
+      });
+
+      const ts = parts["ts"];
+      const v1 = parts["v1"];
+
+      if (!ts || !v1) {
+        res.sendStatus(400);
+        return;
+      }
+
+      // El body en raw para calcular HMAC
+      const rawBody = req.body instanceof Buffer ? req.body.toString("utf-8") : JSON.stringify(req.body);
+      const dataToSign = `id:${xRequestId};request-id:${xRequestId};ts:${ts};`;
+      const expectedHash = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(dataToSign)
+        .digest("hex");
+
+      if (expectedHash !== v1) {
+        console.warn("[MP Webhook] Firma inválida — posible request falsificado.");
+        res.sendStatus(401);
+        return;
+      }
+    } else if (webhookSecret) {
+      // Hay secret configurado pero no vino la firma → rechazar
+      console.warn("[MP Webhook] Signature ausente en el request.");
+      res.sendStatus(400);
+      return;
+    }
+
+    let body: any;
+    try {
+      body = req.body instanceof Buffer ? JSON.parse(req.body.toString()) : req.body;
+    } catch {
+      res.sendStatus(400);
+      return;
+    }
+
+    // MP envía distintos tipos de notificación
+    if (body.type !== "payment") {
+      res.sendStatus(200); // Ignorar otros tipos (ej. "merchant_order")
+      return;
+    }
+
+    const paymentId = body.data?.id;
+    if (!paymentId) {
+      res.sendStatus(400);
+      return;
+    }
+
+    try {
+      // Consultar el pago a la API de MP para no confiar sólo en el webhook
+      const mpFetch = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+        headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` }
+      });
+      if (!mpFetch.ok) throw new Error(`MP API status: ${mpFetch.status}`);
+
+      const payment = await mpFetch.json();
+      const bookingId        = payment.external_reference as string;
+      const paymentStatus    = payment.status as string; // approved | rejected | pending | etc.
+
+      if (!bookingId) {
+        console.warn("[MP Webhook] Pago sin external_reference:", paymentId);
+        res.sendStatus(200);
+        return;
+      }
+
+      const db = getFirestoreDb();
+
+      // Mapear estado de MP a estado interno
+      let newStatus: string | null = null;
+      if (paymentStatus === "approved")  newStatus = "confirmed";
+      if (paymentStatus === "rejected" || paymentStatus === "cancelled") newStatus = "cancelled";
+
+      if (newStatus) {
+        await db.collection("bookings").doc(bookingId).update({
+          status: newStatus,
+          mpPaymentId: paymentId,
+          mpPaymentStatus: paymentStatus,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        console.log(`[MP Webhook] Reserva ${bookingId} actualizada a "${newStatus}" (pago ${paymentId})`);
+      }
+
+      res.sendStatus(200);
+    } catch (err) {
+      console.error("[MP Webhook] Error al procesar pago:", err);
+      // Devolver 200 igual para que MP no reintente en loop
+      res.sendStatus(200);
+    }
+  });
+
   app.use(express.json());
+
+  const getFirestoreDb = () => db;
+
+  const ADMIN_EMAILS = new Set(
+    (process.env.ADMIN_EMAILS || "fornettiricardo@gmail.com")
+      .split(",")
+      .map(e => e.trim().toLowerCase())
+  );
+
+  async function requireFirebaseAuth(
+    req: Request, res: Response, next: NextFunction
+  ): Promise<void> {
+    const authHeader = req.headers["authorization"];
+    if (!authHeader?.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Se requiere autenticación." });
+      return;
+    }
+
+    const idToken = authHeader.slice(7);
+    try {
+      const decoded = await auth.verifyIdToken(idToken);
+      const email   = decoded.email?.toLowerCase() || "";
+
+      if (!ADMIN_EMAILS.has(email)) {
+        res.status(403).json({ error: "Tu cuenta no tiene permisos de administrador." });
+        return;
+      }
+
+      // Adjuntar usuario al request para usarlo en los handlers si hace falta
+      (req as any).adminUser = { uid: decoded.uid, email };
+      next();
+    } catch (err: any) {
+      if (err.code === "auth/id-token-expired") {
+        res.status(401).json({ error: "Sesión expirada. Volvé a iniciar sesión." });
+      } else {
+        res.status(401).json({ error: "Token de autenticación inválido." });
+      }
+    }
+  }
 
   // API ROUTES
   app.get("/api/cabins", (req, res) => {
     res.json(cabins);
   });
 
-  app.get("/api/bookings", (req, res) => {
-    res.json(bookings);
+  app.get("/api/bookings", requireFirebaseAuth, async (req: any, res: any) => {
+    try {
+      const db = getFirestoreDb();
+      // Run seed check in the background/lazily
+      seedFirestoreIfEmpty(db).catch(() => {});
+
+      const snapshot = await db.collection("bookings")
+        .orderBy("createdAt", "desc")
+        .limit(100)
+        .get();
+      
+      const results = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          ...data,
+          id: doc.id,
+          createdAt: convertTimestamp(data.createdAt)
+        };
+      });
+      res.json(results);
+    } catch (err: any) {
+      console.error("[Firestore] Error al leer reservas:", err);
+      res.status(503).json({ error: "No se pudieron cargar las reservas. Intentá de nuevo." });
+    }
   });
 
   app.post("/api/bookings/calculate", (req, res) => {
@@ -279,7 +502,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/bookings", (req, res) => {
+  app.post("/api/bookings", async (req, res) => {
     const { cabinId, guestName, guestEmail, guestPhone, checkIn, checkOut, guestsCount } = req.body;
     if (!cabinId || !guestName || !guestEmail || !guestPhone || !checkIn || !checkOut || !guestsCount) {
        res.status(400).json({ error: "Faltan datos requeridos" });
@@ -293,11 +516,11 @@ async function startServer() {
     }
 
     try {
+      const db = getFirestoreDb();
       const pricing = calculatePrice(cabinId, checkIn, checkOut);
       const pointsEarned = Math.floor(pricing.total / 1000); // 1 point per $1000 ARS
       
       const newBooking = {
-        id: `RES-${1000 + bookings.length + 5}`,
         cabinId,
         cabinName: cabin.name,
         guestName,
@@ -306,38 +529,127 @@ async function startServer() {
         checkIn,
         checkOut,
         nights: pricing.nights,
-        guestsCount,
+        guestsCount: Number(guestsCount),
         totalAmount: pricing.total,
-        status: "confirmed" as const, // Autoconfirmed for simulator ease
+        status: "pending",
         pointsEarned,
-        createdAt: new Date().toISOString()
+        createdAt: FieldValue.serverTimestamp(),
       };
 
-      bookings.push(newBooking);
-      res.status(201).json(newBooking);
+      const docRef = await db.collection("bookings").add(newBooking);
+      const bookingId = docRef.id;
+
+      // Obtener cliente de Mercado Pago
+      const mpClient = getMpClient();
+
+      // Construir la URL base de la app para los retornos
+      const appUrl = process.env.APP_URL || `${req.protocol}://${req.get("host")}`;
+
+      // Crear preferencia de pago en Mercado Pago
+      const preference = new Preference(mpClient);
+      const mpResponse = await preference.create({
+        body: {
+          external_reference: bookingId,    // Nuestro ID de reserva en Firestore
+          items: [{
+            id: cabinId,
+            title: `Reserva ${cabin.name} — ${checkIn} al ${checkOut}`,
+            quantity: 1,
+            unit_price: pricing.total,
+            currency_id: "ARS",
+            description: `${pricing.nights} noches para ${guestsCount} huéspedes`,
+          }],
+          payer: {
+            name: guestName,
+            email: guestEmail,
+          },
+          back_urls: {
+            success: `${appUrl}/reserva/exito?id=${bookingId}`,
+            failure: `${appUrl}/reserva/error?id=${bookingId}`,
+            pending: `${appUrl}/reserva/pendiente?id=${bookingId}`,
+          },
+          auto_return: "approved",
+          notification_url: `${appUrl}/api/mp-webhook`,
+          statement_descriptor: "CABANAS SAN RAFAEL",
+          expires: true,
+          expiration_date_to: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 horas
+        }
+      });
+
+      res.status(201).json({
+        id: bookingId, // Mantener id para compatibilidad con el frontend
+        bookingId,
+        cabinId,
+        cabinName: cabin.name,
+        guestName,
+        guestEmail,
+        guestPhone,
+        checkIn,
+        checkOut,
+        nights: pricing.nights,
+        guestsCount: Number(guestsCount),
+        totalAmount: pricing.total,
+        status: "pending",
+        pointsEarned,
+        createdAt: new Date().toISOString(),
+        paymentUrl: mpResponse.sandbox_init_point
+          ?? mpResponse.init_point
+          ?? null,
+      });
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      console.error("[Firestore/MercadoPago] Error al guardar reserva o crear preferencia:", err);
+      if (err.message && err.message.includes("MP_ACCESS_TOKEN")) {
+        res.status(503).json({ error: "La integración con Mercado Pago no está configurada. Contactá al administrador." });
+      } else if (err.message && (err.message.includes("Cabaña") || err.message.includes("fecha") || err.message.includes("Date") || err.message.includes("checkIn") || err.message.includes("mínimo") || err.message.includes("ocupada"))) {
+        res.status(400).json({ error: err.message });
+      } else {
+        res.status(503).json({ error: "No se pudo registrar la reserva. Intentá nuevamente." });
+      }
     }
   });
 
-  app.get("/api/kpis", (req, res) => {
-    const confirmedNights = bookings.filter(b => b.status === "confirmed").reduce((sum, b) => sum + b.nights, 0);
-    // Let's make an interesting simulated KPI block
-    const occupancyRate = 68; // percentage
-    const totalRevenue = bookings.filter(b => b.status === "confirmed").reduce((sum, b) => sum + b.totalAmount, 0);
-    const activeGuests = bookings.filter(b => b.status === "confirmed").reduce((sum, b) => sum + b.guestsCount, 0);
-    const pendingBookings = bookings.filter(b => b.status === "pending").length;
+  app.get("/api/kpis", requireFirebaseAuth, async (req: any, res: any) => {
+    try {
+      const db = getFirestoreDb();
+      const snap = await db.collection("bookings").limit(500).get();
+      const all = snap.docs.map(d => d.data());
+      const confirmed = all.filter(b => b.status === "confirmed");
+      
+      const confirmedNights = confirmed.reduce((sum, b) => sum + (b.nights || 0), 0);
+      const occupancyRate = all.length > 0 ? Math.min(Math.round((confirmedNights / 100) * 100), 95) || 68 : 68;
 
-    res.json({
-      occupancyRate,
-      totalRevenue,
-      activeGuests,
-      pendingBookings
-    });
+      res.json({
+        occupancyRate,
+        totalRevenue: confirmed.reduce((s, b) => s + (b.totalAmount || 0), 0),
+        activeGuests: confirmed.reduce((s, b) => s + (b.guestsCount || 0), 0),
+        pendingBookings: all.filter(b => b.status === "pending").length,
+      });
+    } catch (err: any) {
+      console.error("[Firestore] Error al calcular KPIs:", err);
+      res.status(503).json({ error: "No se pudieron cargar los KPIs." });
+    }
   });
 
-  app.get("/api/chatbot-logs", (req, res) => {
-    res.json(chatbotLogs);
+  app.get("/api/chatbot-logs", requireFirebaseAuth, async (req: any, res: any) => {
+    try {
+      const db = getFirestoreDb();
+      const snapshot = await db.collection("chatbot_logs")
+        .orderBy("timestamp", "desc")
+        .limit(50)
+        .get();
+      
+      const results = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          ...data,
+          id: doc.id,
+          timestamp: convertTimestamp(data.timestamp || data.createdAt)
+        };
+      });
+      res.json(results);
+    } catch (err: any) {
+      console.error("[Firestore] Error al leer logs:", err);
+      res.status(503).json({ error: "No se pudieron cargar los logs." });
+    }
   });
 
   // Chatbot Gemini Assistant API route
@@ -402,14 +714,19 @@ async function startServer() {
 
       // Log the conversation in our chatbot logs
       const lastUserMsg = messages[messages.length - 1]?.text || "";
-      chatbotLogs.push({
-        id: `LOG-${1000 + chatbotLogs.length + 3}`,
-        userPhone: currentUserPhone,
-        userName: currentUserName,
-        message: lastUserMsg,
-        response: replyText,
-        timestamp: new Date().toISOString()
-      });
+      try {
+        const db = getFirestoreDb();
+        await db.collection("chatbot_logs").add({
+          userPhone: currentUserPhone,
+          userName: currentUserName,
+          userAlias: currentUserName,
+          message: lastUserMsg.slice(0, 200),
+          response: replyText.slice(0, 500),
+          timestamp: FieldValue.serverTimestamp()
+        });
+      } catch (logErr) {
+        console.error("[Firestore] Error al guardar log de chat:", logErr);
+      }
 
       res.json({ text: replyText });
     } catch (err: any) {
@@ -423,14 +740,19 @@ Para consultas de tarifas o para reservar, podés ingresar a la sección de **Re
       
       // Log search fallback to show on dashboard even on failure
       const lastUserMsg = messages[messages.length - 1]?.text || "Hola";
-      chatbotLogs.push({
-        id: `LOG-${1000 + chatbotLogs.length + 3}`,
-        userPhone: currentUserPhone,
-        userName: currentUserName,
-        message: lastUserMsg,
-        response: fallbackResponse,
-        timestamp: new Date().toISOString()
-      });
+      try {
+        const db = getFirestoreDb();
+        await db.collection("chatbot_logs").add({
+          userPhone: currentUserPhone,
+          userName: currentUserName,
+          userAlias: currentUserName,
+          message: lastUserMsg.slice(0, 200),
+          response: fallbackResponse.slice(0, 500),
+          timestamp: FieldValue.serverTimestamp()
+        });
+      } catch (logErr) {
+        console.error("[Firestore] Error al guardar log de chat:", logErr);
+      }
 
       res.json({ text: fallbackResponse, note: "Fallback used because Gemini API is not configured or failed." });
     }

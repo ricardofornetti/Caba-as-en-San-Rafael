@@ -33,6 +33,7 @@ export interface Booking {
   status: 'pending' | 'confirmed' | 'cancelled';
   pointsEarned: number;
   createdAt: string;
+  paymentUrl?: string | null;
 }
 
 export interface Message {
