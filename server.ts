@@ -356,10 +356,11 @@ function calculatePrice(cabinId: string, checkIn: string, checkOut: string): {
   };
 }
 
+const app = express();
+const PORT = 3000;
+
 // Start Server Wrapper
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
 
   // 2. CABECERAS DE SEGURIDAD HTTP en cada respuesta
   app.use((_req, res, next) => {
@@ -936,11 +937,15 @@ Para consultas de tarifas o para reservar, podés ingresar a la sección de **Re
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
+  if (process.env.NODE_ENV !== "production") {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://0.0.0.0:${PORT}`);
+    });
+  }
 }
 
 startServer().catch((err) => {
   console.error("Failed to start server", err);
 });
+
+export default app;
