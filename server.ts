@@ -2,7 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  * 
- * MEJORAS CRÍTICAS APLICADAS POR EL ARQUITECTO DE SEGURIDAD WEB:
+ * MEJORAS CRÍTICAS APLICADAS POR EL ARQUITECTO DE SEGURIDAD WEB :
  * 1. PERSISTENCIA CON FIRESTORE: Reemplazo de colecciones y arrays en memoria por la base de datos Firestore ("bookings" y "chatbot_logs").
  * 2. FIRESTORE SECURITY RULES: Creación de archivo firestore.rules para denegar acceso directo no autorizado desde los clientes de Firebase.
  * 3. AUTENTICACIÓN ADMIN CON GOOGLE SIGN-IN: Middleware robusto "requireFirebaseAuth" que valida tokens e-mail con lista blanca.
