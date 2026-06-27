@@ -13,7 +13,16 @@ export function ensureInitialized() {
       process.exit(1);
     }
 
-    const formattedPrivateKey = privateKey.replace(/\\n/g, "\n");
+    const rawKey = process.env.FIREBASE_PRIVATE_KEY || "";
+    const formattedPrivateKey = rawKey
+      .replace(/\\\\n/g, "\n")  // caso: doble escape \\n
+      .replace(/\\n/g, "\n")    // caso: escape simple \n
+      .replace(/\n/g, "\n");    // caso: ya tiene saltos reales (no-op)
+
+    console.log("Private key starts:", formattedPrivateKey.slice(0, 40));
+    console.log("Private key ends:", formattedPrivateKey.slice(-30));
+    console.log("Has real newlines:", formattedPrivateKey.includes("\n"));
+
     try {
       initializeApp({
         credential: cert({
