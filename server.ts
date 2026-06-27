@@ -12,7 +12,7 @@
 
 import express, { Request, Response, NextFunction } from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
+// Vite is only imported dynamically in development to avoid deployment issues in production environments (like Vercel) where it is a devDependency.
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { FieldValue } from "firebase-admin/firestore";
@@ -357,10 +357,7 @@ function calculatePrice(cabinId: string, checkIn: string, checkOut: string): {
 }
 
 const app = express();
-const PORT = 3000;
-
-// Start Server Wrapper
-async function startServer() {
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
   // 2. CABECERAS DE SEGURIDAD HTTP en cada respuesta
   app.use((_req, res, next) => {
@@ -923,29 +920,29 @@ Para consultas de tarifas o para reservar, podés ingresar a la sección de **Re
   });
 
   // Serve static files and integrate Vite in dev mode
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+  async function setupVite() {
+    if (process.env.NODE_ENV !== "production") {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+      
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://0.0.0.0:${PORT}`);
+      });
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
   }
 
-  if (process.env.NODE_ENV !== "production") {
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://0.0.0.0:${PORT}`);
-    });
-  }
-}
-
-startServer().catch((err) => {
-  console.error("Failed to start server", err);
-});
+  setupVite().catch((err) => {
+    console.error("Vite/Server initialization error:", err);
+  });
 
 export default app;
