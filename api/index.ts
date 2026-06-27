@@ -1,4 +1,6 @@
-const path = require('path');
-require('ts-node/register');
-const app = require('../server').default;
-module.exports = app;
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import app from "../server";
+
+export default function handler(req: VercelRequest, res: VercelResponse) {
+  return app(req, res);
+}
